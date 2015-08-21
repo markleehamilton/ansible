@@ -16,6 +16,7 @@
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
 import os
+import sys
 import stat
 import array
 import errno
@@ -43,8 +44,16 @@ except ImportError:
 
 try:
     import json
+    # Detect python-json which is incompatible and fallback to simplejson in
+    # that case
+    try:
+        json.loads
+        json.dumps
+    except AttributeError:
+        raise ImportError
 except ImportError:
     import simplejson as json
+
 
 # --------------------------------------------------------------
 # timeout function to make sure some fact gathering
@@ -116,6 +125,7 @@ class Facts(object):
                  { 'path' : '/bin/opkg',            'name' : 'opkg' },
                  { 'path' : '/opt/local/bin/pkgin', 'name' : 'pkgin' },
                  { 'path' : '/opt/local/bin/port',  'name' : 'macports' },
+                 { 'path' : '/usr/local/bin/brew',  'name' : 'homebrew' },
                  { 'path' : '/sbin/apk',            'name' : 'apk' },
                  { 'path' : '/usr/sbin/pkg',        'name' : 'pkgng' },
                  { 'path' : '/usr/sbin/swlist',     'name' : 'SD-UX' },
@@ -141,6 +151,7 @@ class Facts(object):
             self.get_user_facts()
             self.get_local_facts()
             self.get_env_facts()
+            self.get_dns_facts()
 
     def populate(self):
         return self.facts
@@ -175,15 +186,20 @@ class Facts(object):
         if self.facts['system'] == 'Linux':
             self.get_distribution_facts()
         elif self.facts['system'] == 'AIX':
-            try:
-                rc, out, err = module.run_command("/usr/sbin/bootinfo -p")
+            # Attempt to use getconf to figure out architecture
+            # fall back to bootinfo if needed
+            if module.get_bin_path('getconf'):
+                rc, out, err = module.run_command([module.get_bin_path('getconf'),
+                                                   'MACHINE_ARCHITECTURE'])
                 data = out.split('\n')
                 self.facts['architecture'] = data[0]
-            except:
-                self.facts['architecture'] = 'Not Available'
+            else:
+                rc, out, err = module.run_command([module.get_bin_path('bootinfo'),
+                                                   '-p'])
+                data = out.split('\n')
+                self.facts['architecture'] = data[0]
         elif self.facts['system'] == 'OpenBSD':
             self.facts['architecture'] = platform.uname()[5]
-
 
     def get_local_facts(self):
 
@@ -622,6 +638,37 @@ class Facts(object):
         for k,v in os.environ.iteritems():
             self.facts['env'][k] = v
 
+    def get_dns_facts(self):
+        self.facts['dns'] = {}
+        for line in get_file_lines('/etc/resolv.conf'):
+            if line.startswith('#') or line.startswith(';') or line.strip() == '':
+                continue
+            tokens = line.split()
+            if len(tokens) == 0:
+                continue
+            if tokens[0] == 'nameserver':
+                self.facts['dns']['nameservers'] = []
+                for nameserver in tokens[1:]:
+                    self.facts['dns']['nameservers'].append(nameserver)
+            elif tokens[0] == 'domain':
+                self.facts['dns']['domain'] = tokens[1]
+            elif tokens[0] == 'search':
+                self.facts['dns']['search'] = []
+                for suffix in tokens[1:]:
+                    self.facts['dns']['search'].append(suffix)
+            elif tokens[0] == 'sortlist':
+                self.facts['dns']['sortlist'] = []
+                for address in tokens[1:]:
+                    self.facts['dns']['sortlist'].append(address)
+            elif tokens[0] == 'options':
+                self.facts['dns']['options'] = {}
+                for option in tokens[1:]:
+                    option_tokens = option.split(':', 1)
+                    if len(option_tokens) == 0:
+                        continue
+                    val = len(option_tokens) == 2 and option_tokens[1] or True
+                    self.facts['dns']['options'][option_tokens[0]] = val
+
 class Hardware(Facts):
     """
     This is a generic Hardware subclass of Facts.  This should be further
@@ -682,6 +729,7 @@ class LinuxHardware(Hardware):
         self.get_dmi_facts()
         self.get_device_facts()
         self.get_uptime_facts()
+        self.get_lvm_facts()
         try:
             self.get_mount_facts()
         except TimeoutError:
@@ -772,7 +820,7 @@ class LinuxHardware(Hardware):
 
             # model name is for Intel arch, Processor (mind the uppercase P)
             # works for some ARM devices, like the Sheevaplug.
-            if key == 'model name' or key == 'Processor' or key == 'vendor_id':
+            if key in ['model name', 'Processor', 'vendor_id', 'cpu', 'Vendor']:
                 if 'processor' not in self.facts:
                     self.facts['processor'] = []
                 self.facts['processor'].append(data[1].strip())
@@ -1006,7 +1054,8 @@ class LinuxHardware(Hardware):
                 pciid = m.group(1)
                 did = re.escape(pciid)
                 m = re.search("^" + did + "\s(.*)$", pcidata, re.MULTILINE)
-                d['host'] = m.group(1)
+                if m:
+                    d['host'] = m.group(1)
 
             d['holders'] = []
             if os.path.isdir(sysdir + "/holders"):
@@ -1024,6 +1073,37 @@ class LinuxHardware(Hardware):
     def get_uptime_facts(self):
         uptime_seconds_string = get_file_content('/proc/uptime').split(' ')[0]
         self.facts['uptime_seconds'] = int(float(uptime_seconds_string))
+
+    def get_lvm_facts(self):
+        """ Get LVM Facts if running as root and lvm utils are available """
+
+        if os.getuid() == 0 and module.get_bin_path('vgs'):
+            lvm_util_options = '--noheadings --nosuffix --units g'
+
+            vgs_path = module.get_bin_path('vgs')
+            #vgs fields: VG #PV #LV #SN Attr VSize VFree
+            vgs={}
+            if vgs_path:
+                rc, vg_lines, err = module.run_command( '%s %s' % (vgs_path, lvm_util_options))
+                for vg_line in vg_lines.splitlines():
+                    items = vg_line.split()
+                    vgs[items[0]] = {'size_g':items[-2],
+                                     'free_g':items[-1],
+                                     'num_lvs': items[2],
+                                     'num_pvs': items[1]}
+
+            lvs_path = module.get_bin_path('lvs')
+            #lvs fields:
+            #LV VG Attr LSize Pool Origin Data% Move Log Copy% Convert
+            lvs = {}
+            if lvs_path:
+                rc, lv_lines, err = module.run_command( '%s %s' % (lvs_path, lvm_util_options))
+                for lv_line in lv_lines.splitlines():
+                    items = lv_line.split()
+                    lvs[items[0]] = {'size_g': items[3], 'vg': items[1]}
+
+            self.facts['lvm'] = {'lvs': lvs, 'vgs': vgs}
+
 
 class SunOSHardware(Hardware):
     """
@@ -1816,6 +1896,8 @@ class LinuxNetwork(Network):
                     path = os.path.join(path, 'bonding', 'all_slaves_active')
                     if os.path.exists(path):
                         interfaces[device]['all_slaves_active'] = get_file_content(path) == '1'
+            if os.path.exists(os.path.join(path,'device')):
+                interfaces[device]['pciid'] = os.path.basename(os.readlink(os.path.join(path,'device')))
 
             # Check whether an interface is in promiscuous mode
             if os.path.exists(os.path.join(path,'flags')):
@@ -1832,9 +1914,12 @@ class LinuxNetwork(Network):
                     if not line:
                         continue
                     words = line.split()
+                    broadcast = ''
                     if words[0] == 'inet':
                         if '/' in words[1]:
                             address, netmask_length = words[1].split('/')
+                            if len(words) > 3:
+                                broadcast = words[3]
                         else:
                             # pointopoint interfaces do not have a prefix
                             address = words[1]
@@ -1848,6 +1933,7 @@ class LinuxNetwork(Network):
                             interfaces[iface] = {}
                         if not secondary and "ipv4" not in interfaces[iface]:
                             interfaces[iface]['ipv4'] = {'address': address,
+                                                         'broadcast': broadcast,
                                                          'netmask': netmask,
                                                          'network': network}
                         else:
@@ -1855,6 +1941,7 @@ class LinuxNetwork(Network):
                                 interfaces[iface]["ipv4_secondaries"] = []
                             interfaces[iface]["ipv4_secondaries"].append({
                                 'address': address,
+                                'broadcast': broadcast,
                                 'netmask': netmask,
                                 'network': network,
                             })
@@ -1865,12 +1952,14 @@ class LinuxNetwork(Network):
                                 interfaces[device]["ipv4_secondaries"] = []
                             interfaces[device]["ipv4_secondaries"].append({
                                 'address': address,
+                                'broadcast': broadcast,
                                 'netmask': netmask,
                                 'network': network,
                             })
 
                         # If this is the default address, update default_ipv4
                         if 'address' in default_ipv4 and default_ipv4['address'] == address:
+                            default_ipv4['broadcast'] = broadcast 
                             default_ipv4['netmask'] = netmask
                             default_ipv4['network'] = network
                             default_ipv4['macaddress'] = macaddress
@@ -2146,6 +2235,57 @@ class GenericBsdIfconfigNetwork(Network):
             for item in ifinfo[ip_type][0].keys():
                 defaults[item] = ifinfo[ip_type][0][item]
 
+class HPUXNetwork(Network):
+    """
+    HP-UX-specifig subclass of Network. Defines networking facts:
+    - default_interface
+    - interfaces (a list of interface names)
+    - interface_<name> dictionary of ipv4 address information.
+    """
+    platform = 'HP-UX'
+
+    def __init__(self, module):
+        Network.__init__(self, module)
+
+    def populate(self):
+        netstat_path = self.module.get_bin_path('netstat')
+        if netstat_path is None:
+            return self.facts
+        self.get_default_interfaces()
+        interfaces = self.get_interfaces_info()
+        self.facts['interfaces'] = interfaces.keys()
+        for iface in interfaces:
+                self.facts[iface] = interfaces[iface]
+        return self.facts
+
+    def get_default_interfaces(self):
+        rc, out, err = module.run_command("/usr/bin/netstat -nr")
+        lines = out.split('\n')
+        for line in lines:
+                words = line.split()
+                if len(words) > 1:
+                    if words[0] == 'default':
+                        self.facts['default_interface'] = words[4]
+                        self.facts['default_gateway'] = words[1]
+
+    def get_interfaces_info(self):
+        interfaces = {}
+        rc, out, err = module.run_command("/usr/bin/netstat -ni")
+        lines = out.split('\n')
+        for line in lines:
+            words = line.split()
+            for i in range(len(words) - 1):
+                if words[i][:3] == 'lan':
+                    device = words[i]
+                    interfaces[device] = { 'device': device }
+                    address = words[i+3]
+                    interfaces[device]['ipv4'] = { 'address': address }
+                    network = words[i+2]
+                    interfaces[device]['ipv4'] = { 'network': network,
+                                                   'interface': device,
+                                                   'address': address }
+        return interfaces
+
 class DarwinNetwork(GenericBsdIfconfigNetwork, Network):
     """
     This is the Mac OS X/Darwin Network Class.
@@ -2177,6 +2317,26 @@ class AIXNetwork(GenericBsdIfconfigNetwork, Network):
     It uses the GenericBsdIfconfigNetwork unchanged.
     """
     platform = 'AIX'
+
+    def get_default_interfaces(self, route_path):
+        netstat_path = module.get_bin_path('netstat')
+
+        rc, out, err = module.run_command([netstat_path, '-nr'])
+
+        interface = dict(v4 = {}, v6 = {})
+
+        lines = out.split('\n')
+        for line in lines:
+            words = line.split()
+            if len(words) > 1 and words[0] == 'default':
+                if '.' in words[1]:
+                    interface['v4']['gateway'] = words[1]
+                    interface['v4']['interface'] = words[5]
+                elif ':' in words[1]:
+                    interface['v6']['gateway'] = words[1]
+                    interface['v6']['interface'] = words[5]
+
+        return interface['v4'], interface['v6']
 
     # AIX 'ifconfig -a' does not have three words in the interface line
     def get_interfaces_info(self, ifconfig_path, ifconfig_options):
@@ -2419,6 +2579,12 @@ class LinuxVirtual(Virtual):
                 self.facts['virtualization_role'] = 'host'
             else:
                 self.facts['virtualization_role'] = 'guest'
+            return
+
+        systemd_container = get_file_content('/run/systemd/container')
+        if systemd_container:
+            self.facts['virtualization_type'] = systemd_container
+            self.facts['virtualization_role'] = 'guest'
             return
 
         if os.path.exists('/proc/1/cgroup'):
@@ -2740,12 +2906,16 @@ def get_all_facts(module):
     for (k, v) in facts.items():
         setup_options["ansible_%s" % k.replace('-', '_')] = v
 
-    # Look for the path to the facter and ohai binary and set
+    # Look for the path to the facter, cfacter, and ohai binaries and set
     # the variable to that path.
 
     facter_path = module.get_bin_path('facter')
+    cfacter_path = module.get_bin_path('cfacter')
     ohai_path = module.get_bin_path('ohai')
 
+    # Prefer to use cfacter if available
+    if cfacter_path is not None:
+        facter_path = cfacter_path
     # if facter is installed, and we can use --json because
     # ruby-json is ALSO installed, include facter data in the JSON
 
@@ -2781,6 +2951,6 @@ def get_all_facts(module):
             setup_result['ansible_facts'][k] = v
 
     # hack to keep --verbose from showing all the setup module results
-    setup_result['verbose_override'] = True
+    setup_result['_ansible_verbose_override'] = True
 
     return setup_result

@@ -34,6 +34,7 @@ from ansible import constants as C
 from ansible.errors import AnsibleError, AnsibleOptionsError
 from ansible.utils.unicode import to_bytes
 from ansible.utils.display import Display
+from ansible.utils.path import is_executable
 
 class SortedOptParser(optparse.OptionParser):
     '''Optparser which sorts the options by opt before outputting --help'''
@@ -101,7 +102,10 @@ class CLI(object):
     def run(self):
 
         if self.options.verbosity > 0:
-            self.display.display("Using %s as config file" % C.CONFIG_FILE)
+            if C.CONFIG_FILE:
+                self.display.display("Using %s as config file" % C.CONFIG_FILE)
+            else:
+                self.display.display("No config file found; using defaults")
 
     @staticmethod
     def ask_vault_passwords(ask_vault_pass=False, ask_new_vault_pass=False, confirm_vault=False, confirm_new=False):
@@ -182,7 +186,7 @@ class CLI(object):
             self.options.become_method = 'su'
 
 
-    def validate_conflicts(self, vault_opts=False, runas_opts=False):
+    def validate_conflicts(self, vault_opts=False, runas_opts=False, fork_opts=False):
         ''' check for conflicting options '''
 
         op = self.options
@@ -207,13 +211,17 @@ class CLI(object):
                                   "and become arguments ('--become', '--become-user', and '--ask-become-pass')"
                                   " are exclusive of each other")
 
+        if fork_opts:
+            if op.forks < 1:
+                self.parser.error("The number of processes (--forks) must be >= 1")
+
     @staticmethod
     def expand_tilde(option, opt, value, parser):
         setattr(parser.values, option.dest, os.path.expanduser(value))
 
     @staticmethod
     def base_parser(usage="", output_opts=False, runas_opts=False, meta_opts=False, runtask_opts=False, vault_opts=False,
-        async_opts=False, connect_opts=False, subset_opts=False, check_opts=False, diff_opts=False, epilog=None, fork_opts=False):
+        async_opts=False, connect_opts=False, subset_opts=False, check_opts=False, inventory_opts=False, epilog=None, fork_opts=False):
         ''' create an options parser for most ansible scripts '''
 
         #FIXME: implemente epilog parsing
@@ -224,12 +232,16 @@ class CLI(object):
         parser.add_option('-v','--verbose', dest='verbosity', default=0, action="count",
             help="verbose mode (-vvv for more, -vvvv to enable connection debugging)")
 
-        if runtask_opts:
+        if inventory_opts:
             parser.add_option('-i', '--inventory-file', dest='inventory',
                 help="specify inventory host file (default=%s)" % C.DEFAULT_HOST_LIST,
                 default=C.DEFAULT_HOST_LIST, action="callback", callback=CLI.expand_tilde, type=str)
             parser.add_option('--list-hosts', dest='listhosts', action='store_true',
                 help='outputs a list of matching hosts; does not execute anything else')
+            parser.add_option('-l', '--limit', default=C.DEFAULT_SUBSET, dest='subset',
+                help='further limit selected hosts to an additional pattern')
+
+        if runtask_opts:
             parser.add_option('-M', '--module-path', dest='module_path',
                 help="specify path(s) to module library (default=%s)" % C.DEFAULT_MODULE_PATH, default=None,
                 action="callback", callback=CLI.expand_tilde, type=str)
@@ -239,8 +251,6 @@ class CLI(object):
         if fork_opts:
             parser.add_option('-f','--forks', dest='forks', default=C.DEFAULT_FORKS, type='int',
                 help="specify number of parallel processes to use (default=%s)" % C.DEFAULT_FORKS)
-            parser.add_option('-l', '--limit', default=C.DEFAULT_SUBSET, dest='subset',
-                help='further limit selected hosts to an additional pattern')
 
         if vault_opts:
             parser.add_option('--ask-vault-pass', default=False, dest='ask_vault_pass', action='store_true',
@@ -300,8 +310,7 @@ class CLI(object):
                 help="override the connection timeout in seconds (default=%s)" % C.DEFAULT_TIMEOUT)
 
         if async_opts:
-            parser.add_option('-P', '--poll', default=C.DEFAULT_POLL_INTERVAL, type='int',
-                dest='poll_interval',
+            parser.add_option('-P', '--poll', default=C.DEFAULT_POLL_INTERVAL, type='int', dest='poll_interval',
                 help="set the poll interval if using -B (default=%s)" % C.DEFAULT_POLL_INTERVAL)
             parser.add_option('-B', '--background', dest='seconds', type='int', default=0,
                 help='run asynchronously, failing after X seconds (default=N/A)')
@@ -311,14 +320,11 @@ class CLI(object):
                 help="don't make any changes; instead, try to predict some of the changes that may occur")
             parser.add_option('--syntax-check', dest='syntax', action='store_true',
                 help="perform a syntax check on the playbook, but do not execute it")
-
-        if diff_opts:
             parser.add_option("-D", "--diff", default=False, dest='diff', action='store_true',
-                help="when changing (small) files and templates, show the differences in those files; works great with --check"
-            )
+                help="when changing (small) files and templates, show the differences in those files; works great with --check")
 
         if meta_opts:
-            parser.add_option('--force-handlers', dest='force_handlers', action='store_true',
+            parser.add_option('--force-handlers', default=C.DEFAULT_FORCE_HANDLERS, dest='force_handlers', action='store_true',
                 help="run handlers even if a task fails")
             parser.add_option('--flush-cache', dest='flush_cache', action='store_true',
                 help="clear the fact cache")
@@ -332,6 +338,7 @@ class CLI(object):
         gitinfo = CLI._gitinfo()
         if gitinfo:
             result = result + " {0}".format(gitinfo)
+        result += "\n  config file = %s" % C.CONFIG_FILE
         result = result + "\n  configured module search path = %s" % C.DEFAULT_MODULE_PATH
         return result
 
@@ -423,21 +430,20 @@ class CLI(object):
         return result
 
 
-    @staticmethod
-    def pager(text):
+    def pager(self, text):
         ''' find reasonable way to display text '''
         # this is a much simpler form of what is in pydoc.py
         if not sys.stdout.isatty():
-            print(text)
+            self.display.display(text)
         elif 'PAGER' in os.environ:
             if sys.platform == 'win32':
-                print(text)
+                self.display.display(text)
             else:
-                CLI.pager_pipe(text, os.environ['PAGER'])
+                self.pager_pipe(text, os.environ['PAGER'])
         elif subprocess.call('(less --version) 2> /dev/null', shell = True) == 0:
-            CLI.pager_pipe(text, 'less')
+            self.pager_pipe(text, 'less')
         else:
-            print(text)
+            self.display.display(text)
 
     @staticmethod
     def pager_pipe(text, cmd):
@@ -446,7 +452,7 @@ class CLI(object):
             os.environ['LESS'] = CLI.LESS_OPTS
         try:
             cmd = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE, stdout=sys.stdout)
-            cmd.communicate(input=text)
+            cmd.communicate(input=text.encode(sys.stdout.encoding))
         except IOError:
             pass
         except KeyboardInterrupt:
@@ -462,3 +468,33 @@ class CLI(object):
         t = self._CONST.sub("`" + r"\1" + "'", t)        # C(word) => `word'
 
         return t
+
+    @staticmethod
+    def read_vault_password_file(vault_password_file):
+        """
+        Read a vault password from a file or if executable, execute the script and
+        retrieve password from STDOUT
+        """
+
+        this_path = os.path.realpath(os.path.expanduser(vault_password_file))
+        if not os.path.exists(this_path):
+            raise AnsibleError("The vault password file %s was not found" % this_path)
+
+        if is_executable(this_path):
+            try:
+                # STDERR not captured to make it easier for users to prompt for input in their scripts
+                p = subprocess.Popen(this_path, stdout=subprocess.PIPE)
+            except OSError as e:
+                raise AnsibleError("Problem running vault password script %s (%s). If this is not a script, remove the executable bit from the file." % (' '.join(this_path), e))
+            stdout, stderr = p.communicate()
+            vault_pass = stdout.strip('\r\n')
+        else:
+            try:
+                f = open(this_path, "rb")
+                vault_pass=f.read().strip()
+                f.close()
+            except (OSError, IOError) as e:
+                raise AnsibleError("Could not read vault password file %s: %s" % (this_path, e))
+
+        return vault_pass
+

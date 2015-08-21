@@ -29,13 +29,11 @@ class LookupModule(LookupBase):
 
     def run(self, terms, variables=None, **kwargs):
 
-        if isinstance(terms, basestring):
-            terms = [ terms ]
-
         validate_certs = kwargs.get('validate_certs', True)
 
         ret = []
         for term in terms:
+            self._display.vvvv("url lookup connecting to %s" % term)
             try:
                 response = open_url(term, validate_certs=validate_certs)
             except urllib2.URLError as e:

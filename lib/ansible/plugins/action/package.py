@@ -22,32 +22,34 @@ from ansible.plugins.action import ActionBase
 
 class ActionModule(ActionBase):
 
-    TRANSFERS_FILES = True
+    TRANSFERS_FILES = False
 
     def run(self, tmp=None, task_vars=dict()):
         ''' handler for package operations '''
 
         name  = self._task.args.get('name', None)
         state = self._task.args.get('state', None)
-        module = self._task.args.get('use', None)
+        module = self._task.args.get('use', 'auto')
 
-        if module is None:
+        if module == 'auto':
             try:
                 module = self._templar.template('{{ansible_pkg_mgr}}')
             except:
                 pass # could not get it from template!
 
-        if module is None:
-            #TODO: autodetect the package manager, by invoking that specific fact snippet remotely
-            pass
+        if module == 'auto':
+            facts = self._execute_module(module_name='setup', module_args=dict(filter='ansible_pkg_mgr'), task_vars=task_vars)
+            self._display.degug("Facts %s" % facts)
+            if not 'failed' in facts:
+                module = getattr(facts['ansible_facts'], 'ansible_pkg_mgr', 'auto')
 
-
-        if module is not None:
+        if module != 'auto':
             # run the 'package' module
             new_module_args = self._task.args.copy()
             if 'use' in new_module_args:
                 del new_module_args['use']
 
+            self._display.vvvv("Running %s" % module)
             return self._execute_module(module_name=module, module_args=new_module_args, task_vars=task_vars)
 
         else:

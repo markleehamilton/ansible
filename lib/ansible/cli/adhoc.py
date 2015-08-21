@@ -17,14 +17,14 @@
 
 ########################################################
 from ansible import constants as C
+from ansible.cli import CLI
 from ansible.errors import AnsibleOptionsError
 from ansible.executor.task_queue_manager import TaskQueueManager
 from ansible.inventory import Inventory
 from ansible.parsing import DataLoader
 from ansible.parsing.splitter import parse_kv
 from ansible.playbook.play import Play
-from ansible.cli import CLI
-from ansible.utils.vault import read_vault_file
+from ansible.utils.vars import load_extra_vars
 from ansible.vars import VariableManager
 
 ########################################################
@@ -38,6 +38,7 @@ class AdHocCLI(CLI):
         self.parser = CLI.base_parser(
             usage='%prog <host-pattern> [options]',
             runas_opts=True,
+            inventory_opts=True,
             async_opts=True,
             output_opts=True,
             connect_opts=True,
@@ -60,16 +61,16 @@ class AdHocCLI(CLI):
             raise AnsibleOptionsError("Missing target hosts")
 
         self.display.verbosity = self.options.verbosity
-        self.validate_conflicts(runas_opts=True, vault_opts=True)
+        self.validate_conflicts(runas_opts=True, vault_opts=True, fork_opts=True)
 
         return True
 
-    def _play_ds(self, pattern):
+    def _play_ds(self, pattern, async, poll):
         return dict(
             name = "Ansible Ad-Hoc",
             hosts = pattern,
             gather_facts = 'no',
-            tasks = [ dict(action=dict(module=self.options.module_name, args=parse_kv(self.options.module_args))), ]
+            tasks = [ dict(action=dict(module=self.options.module_name, args=parse_kv(self.options.module_args)), async=async, poll=poll) ]
         )
 
     def run(self):
@@ -95,12 +96,13 @@ class AdHocCLI(CLI):
 
         if self.options.vault_password_file:
             # read vault_pass from a file
-            vault_pass = read_vault_file(self.options.vault_password_file)
+            vault_pass = CLI.read_vault_password_file(self.options.vault_password_file)
         elif self.options.ask_vault_pass:
             vault_pass = self.ask_vault_passwords(ask_vault_pass=True, ask_new_vault_pass=False, confirm_new=False)[0]
 
         loader = DataLoader(vault_password=vault_pass)
         variable_manager = VariableManager()
+        variable_manager.extra_vars = load_extra_vars(loader=loader, options=self.options)
 
         inventory = Inventory(loader=loader, variable_manager=variable_manager, host_list=self.options.inventory)
         variable_manager.set_inventory(inventory)
@@ -110,24 +112,28 @@ class AdHocCLI(CLI):
             self.display.warning("provided hosts list is empty, only localhost is available")
 
         if self.options.listhosts:
+            self.display.display('  hosts (%d):' % len(hosts))
             for host in hosts:
                 self.display.display('    %s' % host)
             return 0
 
         if self.options.module_name in C.MODULE_REQUIRE_ARGS and not self.options.module_args:
-            raise AnsibleOptionsError("No argument passed to %s module" % self.options.module_name)
+            err = "No argument passed to %s module" % self.options.module_name
+            if pattern.endswith(".yml"):
+                err = err + ' (did you mean to run ansible-playbook?)'
+            raise AnsibleOptionsError(err)
 
-        #TODO: implement async support
-        #if self.options.seconds:
-        #    callbacks.display("background launch...\n\n", color='cyan')
-        #    results, poller = runner.run_async(self.options.seconds)
-        #    results = self.poll_while_needed(poller)
-        #else:
-        #    results = runner.run()
-
-        # create a pseudo-play to execute the specified module via a single task
-        play_ds = self._play_ds(pattern)
+        play_ds = self._play_ds(pattern, self.options.seconds, self.options.poll_interval)
         play = Play().load(play_ds, variable_manager=variable_manager, loader=loader)
+
+        if self.options.one_line:
+            cb = 'oneline'
+        else:
+            cb = 'minimal'
+
+        if self.options.tree:
+            C.DEFAULT_CALLBACK_WHITELIST.append('tree')
+            C.TREE_DIR = self.options.tree
 
         # now create a task queue manager to execute the play
         self._tqm = None
@@ -139,7 +145,7 @@ class AdHocCLI(CLI):
                     display=self.display,
                     options=self.options,
                     passwords=passwords,
-                    stdout_callback='minimal',
+                    stdout_callback=cb,
                 )
             result = self._tqm.run(play)
         finally:
@@ -147,15 +153,3 @@ class AdHocCLI(CLI):
                 self._tqm.cleanup()
 
         return result
-
-    # ----------------------------------------------
-
-    def poll_while_needed(self, poller):
-        ''' summarize results from Runner '''
-
-        # BACKGROUND POLL LOGIC when -B and -P are specified
-        if self.options.seconds and self.options.poll_interval > 0:
-            poller.wait(self.options.seconds, self.options.poll_interval)
-
-        return poller.results
-

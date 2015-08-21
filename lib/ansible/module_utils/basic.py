@@ -70,14 +70,21 @@ from itertools import imap, repeat
 
 try:
     import json
+    # Detect the python-json library which is incompatible
+    # Look for simplejson if that's the case
+    try:
+        if not isinstance(json.loads, types.FunctionType) or not isinstance(json.dumps, types.FunctionType):
+            raise ImportError
+    except AttributeError:
+        raise ImportError
 except ImportError:
     try:
         import simplejson as json
     except ImportError:
-        sys.stderr.write('Error: ansible requires a json module, none found!')
+        print('{"msg": "Error: ansible requires the stdlib json or simplejson module, neither was found!", "failed": true}')
         sys.exit(1)
     except SyntaxError:
-        sys.stderr.write('SyntaxError: probably due to json and python being for different versions')
+        print('{"msg": "SyntaxError: probably due to installed simplejson being for a different python version", "failed": true}')
         sys.exit(1)
 
 HAVE_SELINUX=False
@@ -87,32 +94,34 @@ try:
 except ImportError:
     pass
 
-HAVE_HASHLIB=False
-try:
-    from hashlib import sha1 as _sha1
-    HAVE_HASHLIB=True
-except ImportError:
-    from sha import sha as _sha1
-
-try:
-    from hashlib import md5 as _md5
-except ImportError:
-    try:
-        from md5 import md5 as _md5
-    except ImportError:
-        # MD5 unavailable.  Possibly FIPS mode
-        _md5 = None
-
-try:
-    from hashlib import sha256 as _sha256
-except ImportError:
-    pass
-
 try:
     from systemd import journal
     has_journal = True
 except ImportError:
     has_journal = False
+
+AVAILABLE_HASH_ALGORITHMS = dict()
+try:
+    import hashlib
+
+    # python 2.7.9+ and 2.7.0+
+    for attribute in ('available_algorithms', 'algorithms'):
+        algorithms = getattr(hashlib, attribute, None)
+        if algorithms:
+            break
+    if algorithms is None:
+        # python 2.5+
+        algorithms = ('md5', 'sha1', 'sha224', 'sha256', 'sha384', 'sha512')
+    for algorithm in algorithms:
+        AVAILABLE_HASH_ALGORITHMS[algorithm] = getattr(hashlib, algorithm)
+except ImportError:
+    import sha
+    AVAILABLE_HASH_ALGORITHMS = {'sha1': sha.sha}
+    try:
+        import md5
+        AVAILABLE_HASH_ALGORITHMS['md5'] = md5.md5
+    except ImportError:
+        pass
 
 try:
     from ast import literal_eval as _literal_eval
@@ -1063,7 +1072,32 @@ class AnsibleModule(object):
                         raise TypeError('unable to evaluate string as dictionary')
                     return result
             elif '=' in value:
-                return dict([x.strip().split("=", 1) for x in value.split(",")])
+                fields = []
+                field_buffer = []
+                in_quote = False
+                in_escape = False
+                for c in value.strip():
+                    if in_escape:
+                        field_buffer.append(c)
+                        in_escape = False
+                    elif c == '\\':
+                        in_escape = True
+                    elif not in_quote and c in ('\'', '"'):
+                        in_quote = c
+                    elif in_quote and in_quote == c:
+                        in_quote = False
+                    elif not in_quote and c in (',', ' '):
+                        field = ''.join(field_buffer)
+                        if field:
+                            fields.append(field)
+                        field_buffer = []
+                    else:
+                        field_buffer.append(c)
+
+                field = ''.join(field_buffer)
+                if field:
+                    fields.append(field)
+                return dict(x.split("=", 1) for x in fields)
             else:
                 raise TypeError("dictionary requested, could not parse JSON or key=value")
 
@@ -1309,21 +1343,31 @@ class AnsibleModule(object):
                 or stat.S_IXGRP & os.stat(path)[stat.ST_MODE]
                 or stat.S_IXOTH & os.stat(path)[stat.ST_MODE])
 
-    def digest_from_file(self, filename, digest_method):
-        ''' Return hex digest of local file for a given digest_method, or None if file is not present. '''
+    def digest_from_file(self, filename, algorithm):
+        ''' Return hex digest of local file for a digest_method specified by name, or None if file is not present. '''
         if not os.path.exists(filename):
             return None
         if os.path.isdir(filename):
             self.fail_json(msg="attempted to take checksum of directory: %s" % filename)
-        digest = digest_method
+
+        # preserve old behaviour where the third parameter was a hash algorithm object
+        if hasattr(algorithm, 'hexdigest'):
+            digest_method = algorithm
+        else:
+            try:
+                digest_method = AVAILABLE_HASH_ALGORITHMS[algorithm]()
+            except KeyError:
+                self.fail_json(msg="Could not hash file '%s' with algorithm '%s'. Available algorithms: %s" %
+                                   (filename, algorithm, ', '.join(AVAILABLE_HASH_ALGORITHMS)))
+
         blocksize = 64 * 1024
         infile = open(filename, 'rb')
         block = infile.read(blocksize)
         while block:
-            digest.update(block)
+            digest_method.update(block)
             block = infile.read(blocksize)
         infile.close()
-        return digest.hexdigest()
+        return digest_method.hexdigest()
 
     def md5(self, filename):
         ''' Return MD5 hex digest of local file using digest_from_file().
@@ -1336,19 +1380,17 @@ class AnsibleModule(object):
 
         Most uses of this function can use the module.sha1 function instead.
         '''
-        if not _md5:
+        if 'md5' not in AVAILABLE_HASH_ALGORITHMS:
             raise ValueError('MD5 not available.  Possibly running in FIPS mode')
-        return self.digest_from_file(filename, _md5())
+        return self.digest_from_file(filename, 'md5')
 
     def sha1(self, filename):
         ''' Return SHA1 hex digest of local file using digest_from_file(). '''
-        return self.digest_from_file(filename, _sha1())
+        return self.digest_from_file(filename, 'sha1')
 
     def sha256(self, filename):
         ''' Return SHA-256 hex digest of local file using digest_from_file(). '''
-        if not HAVE_HASHLIB:
-            self.fail_json(msg="SHA-256 checksums require hashlib, which is available in Python 2.5 and higher")
-        return self.digest_from_file(filename, _sha256())
+        return self.digest_from_file(filename, 'sha256')
 
     def backup_local(self, fn):
         '''make a date-marked backup of the specified file, return True or False on success or failure'''
@@ -1411,8 +1453,9 @@ class AnsibleModule(object):
             # Optimistically try a rename, solves some corner cases and can avoid useless work, throws exception if not atomic.
             os.rename(src, dest)
         except (IOError,OSError), e:
-            # only try workarounds for errno 18 (cross device), 1 (not permitted) and 13 (permission denied)
-            if e.errno != errno.EPERM and e.errno != errno.EXDEV and e.errno != errno.EACCES:
+            # only try workarounds for errno 18 (cross device), 1 (not permitted),  13 (permission denied)
+            # and 26 (text file busy) which happens on vagrant synced folders
+            if e.errno not in [errno.EPERM, errno.EXDEV, errno.EACCES, errno.ETXTBSY]:
                 self.fail_json(msg='Could not replace file: %s to %s: %s' % (src, dest, e))
 
             dest_dir = os.path.dirname(dest)

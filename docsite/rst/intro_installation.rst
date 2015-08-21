@@ -105,7 +105,7 @@ open source projects.
 
 .. note::
   
-   If you are intending to use Tower as the Control Machine, do not use a source install. Please use apt/yum/pip for a stable version
+   If you are intending to use Tower as the Control Machine, do not use a source install. Please use OS package manager (eg. apt/yum) or pip to install a stable version.
 
 
 To install from source.
@@ -266,6 +266,24 @@ Ansible is available for Solaris as `SysV package from OpenCSW <https://www.open
 
     # pkgadd -d http://get.opencsw.org/now
     # /opt/csw/bin/pkgutil -i ansible
+
+.. _from_pacman:
+
+Latest Releases Via Pacman (Arch Linux)
++++++++++++++++++++++++++++++++++++++++
+
+Ansible is available in the Community repository::
+
+    $ pacman -S ansible
+
+The AUR has a PKGBUILD for pulling directly from Github called `ansible-git <https://aur.archlinux.org/packages/ansible-git>`_.
+
+Also see the `Ansible <https://wiki.archlinux.org/index.php/Ansible>`_ page on the ArchWiki.
+
+.. note::
+
+   If you have Python 3 as a default Python slot on your Arch nodes (default setting), then you
+   must set ``ansible_python_interpreter = /usr/bin/python2`` in your group or inventory variables.
 
 .. _from_pip:
 

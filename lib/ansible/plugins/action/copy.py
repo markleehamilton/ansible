@@ -19,11 +19,9 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
-import base64
 import json
 import os
 import pipes
-import stat
 import tempfile
 
 from ansible import constants as C
@@ -44,16 +42,19 @@ class ActionModule(ActionBase):
         raw     = boolean(self._task.args.get('raw', 'no'))
         force   = boolean(self._task.args.get('force', 'yes'))
         faf     = self._task.first_available_file
+        remote_src = boolean(self._task.args.get('remote_src', False))
 
         if (source is None and content is None and faf is None) or dest is None:
             return dict(failed=True, msg="src (or content) and dest are required")
         elif (source is not None or faf is not None) and content is not None:
             return dict(failed=True, msg="src and content are mutually exclusive")
+        elif content is not None and dest is not None and dest.endswith("/"):
+            return dict(failed=True, msg="dest must be a file if content is defined")
 
         # Check if the source ends with a "/"
         source_trailing_slash = False
         if source:
-            source_trailing_slash = source.endswith(os.sep)
+            source_trailing_slash = self._connection._shell.path_has_trailing_slash(source)
 
         # Define content_tempfile in case we set it after finding content populated.
         content_tempfile = None
@@ -74,26 +75,20 @@ class ActionModule(ActionBase):
         # if we have first_available_file in our vars
         # look up the files and use the first one we find as src
         elif faf:
-            #FIXME: issue deprecation warning for first_available_file, use with_first_found or lookup('first_found',...) instead
-            found = False
-            for fn in faf:
-                fn_orig = fn
-                fnt = self._templar.template(fn)
-                fnd = self._loader.path_dwim_relative(self._task._role._role_path, 'files', fnt)
-                of = task_vars.get('_original_file', None)
-                if not os.path.exists(fnd) and of is not None:
-                    fnd = self._loader.path_dwim_relative(of, 'files', of)
-                if os.path.exists(fnd):
-                    source = fnd
-                    found = True
-                    break
-            if not found:
+            source = self._get_first_available_file(faf, task_vars.get('_original_file', None))
+            if source is None:
                 return  dict(failed=True, msg="could not find src in first_available_file list")
+
+        elif remote_src:
+            new_module_args = self._task.args.copy()
+            del new_module_args['remote_src']
+            return self._execute_module(module_name='copy', module_args=new_module_args, task_vars=task_vars, delete_remote_tmp=False)
+
         else:
             if self._task._role is not None:
                 source = self._loader.path_dwim_relative(self._task._role._role_path, 'files', source)
             else:
-                source = self._loader.path_dwim(source)
+                source = self._loader.path_dwim_relative(self._loader.get_basedir(), 'files', source)
 
         # A list of source file tuples (full_path, relative_path) which will try to copy to the destination
         source_files = []
@@ -102,7 +97,7 @@ class ActionModule(ActionBase):
         if os.path.isdir(source):
             # Get the amount of spaces to remove to get the relative path.
             if source_trailing_slash:
-                sz = len(source)
+                sz = len(source) + 1
             else:
                 sz = len(source.rsplit('/', 1)[0]) + 1
 
@@ -121,7 +116,6 @@ class ActionModule(ActionBase):
             source_files.append((source, os.path.basename(source)))
 
         changed = False
-        diffs = []
         module_result = {"changed": False}
 
         # A register for if we executed a module.
@@ -139,6 +133,7 @@ class ActionModule(ActionBase):
         # expand any user home dir specifier
         dest = self._remote_expand_user(dest, tmp)
 
+        diffs = []
         for source_full, source_rel in source_files:
 
             # Generate a hash of the local file.
@@ -157,7 +152,7 @@ class ActionModule(ActionBase):
                 dest_file = self._connection._shell.join_path(dest)
 
             # Attempt to get the remote checksum
-            remote_checksum = self._remote_checksum(tmp, dest_file)
+            remote_checksum = self._remote_checksum(tmp, dest_file, all_vars=task_vars)
 
             if remote_checksum == '3':
                 # The remote_checksum was executed on a directory.
@@ -168,7 +163,7 @@ class ActionModule(ActionBase):
                 else:
                     # Append the relative source location to the destination and retry remote_checksum
                     dest_file = self._connection._shell.join_path(dest, source_rel)
-                    remote_checksum = self._remote_checksum(tmp, dest_file)
+                    remote_checksum = self._remote_checksum(tmp, dest_file, all_vars=task_vars)
 
             if remote_checksum != '1' and not force:
                 # remote_file does not exist so continue to next iteration.
@@ -184,23 +179,17 @@ class ActionModule(ActionBase):
                     if tmp is None or "-tmp-" not in tmp:
                         tmp = self._make_tmp_path()
 
-                # FIXME: runner shouldn't have the diff option there
-                #if self.runner.diff and not raw:
-                #    diff = self._get_diff_data(tmp, dest_file, source_full, task_vars)
-                #else:
-                #    diff = {}
-                diff = {}
+                if self._play_context.diff and not raw:
+                    diffs.append(self._get_diff_data(tmp, dest_file, source_full, task_vars))
 
-                if self._connection_info.check_mode:
+                if self._play_context.check_mode:
                     self._remove_tempfile_if_content_defined(content, content_tempfile)
-                    # FIXME: diff stuff
-                    #diffs.append(diff)
                     changed = True
                     module_return = dict(changed=True)
                     continue
 
                 # Define a remote directory that we will copy the file to.
-                tmp_src = tmp + 'source'
+                tmp_src = self._connection._shell.join_path(tmp, 'source')
 
                 if not raw:
                     self._connection.put_file(source_full, tmp_src)
@@ -211,7 +200,7 @@ class ActionModule(ActionBase):
                 self._remove_tempfile_if_content_defined(content, content_tempfile)
 
                 # fix file permissions when the copy is done as a different user
-                if self._connection_info.become and self._connection_info.become_user != 'root':
+                if self._play_context.become and self._play_context.become_user != 'root':
                     self._remote_chmod('a+r', tmp_src, tmp)
 
                 if raw:
@@ -241,7 +230,7 @@ class ActionModule(ActionBase):
 
                 if raw:
                     # Continue to next iteration if raw is defined.
-                    # self._remove_tmp_path(tmp)
+                    self._remove_tmp_path(tmp)
                     continue
 
                 # Build temporary module_args.
@@ -274,14 +263,13 @@ class ActionModule(ActionBase):
         if (not C.DEFAULT_KEEP_REMOTE_FILES and not delete_remote_tmp) or (not C.DEFAULT_KEEP_REMOTE_FILES and delete_remote_tmp and not module_executed):
             self._remove_tmp_path(tmp)
 
-        # TODO: Support detailed status/diff for multiple files
         if module_executed and len(source_files) == 1:
             result = module_return
         else:
             result = dict(dest=dest, src=source, changed=changed)
 
-        if len(diffs) == 1:
-            result['diff']=diffs[0]
+        if diffs:
+            result['diff'] = diffs
 
         return result
 
@@ -299,44 +287,6 @@ class ActionModule(ActionBase):
             f.close()
         return content_tempfile
 
-    def _get_diff_data(self, tmp, destination, source, task_vars):
-        peek_result = self._execute_module(module_name='file', module_args=dict(path=destination, diff_peek=True), task_vars=task_vars, persist_files=True)
-        if 'failed' in peek_result and peek_result['failed'] or peek_result.get('rc', 0) != 0:
-            return {}
-
-        diff = {}
-        if peek_result['state'] == 'absent':
-            diff['before'] = ''
-        elif peek_result['appears_binary']:
-            diff['dst_binary'] = 1
-        # FIXME: this should not be in utils..
-        #elif peek_result['size'] > utils.MAX_FILE_SIZE_FOR_DIFF:
-        #    diff['dst_larger'] = utils.MAX_FILE_SIZE_FOR_DIFF
-        else:
-            dest_result = self._execute_module(module_name='slurp', module_args=dict(path=destination), task_vars=task_vars, tmp=tmp, persist_files=True)
-            if 'content' in dest_result:
-                dest_contents = dest_result['content']
-                if dest_result['encoding'] == 'base64':
-                    dest_contents = base64.b64decode(dest_contents)
-                else:
-                    raise Exception("unknown encoding, failed: %s" % dest_result)
-                diff['before_header'] = destination
-                diff['before'] = dest_contents
-
-        src = open(source)
-        src_contents = src.read(8192)
-        st = os.stat(source)
-        if "\x00" in src_contents:
-            diff['src_binary'] = 1
-        # FIXME: this should not be in utils
-        #elif st[stat.ST_SIZE] > utils.MAX_FILE_SIZE_FOR_DIFF:
-        #    diff['src_larger'] = utils.MAX_FILE_SIZE_FOR_DIFF
-        else:
-            src.seek(0)
-            diff['after_header'] = source
-            diff['after'] = src.read()
-
-        return diff
 
     def _remove_tempfile_if_content_defined(self, content, content_tempfile):
         if content is not None:

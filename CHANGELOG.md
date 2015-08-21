@@ -5,19 +5,26 @@ Ansible Changes By Release
 
 Major Changes:
  * Introducing the new block/rescue/always directives, allow for making task blocks and introducing exception like semantics
- * New stratergy plugins, allow to control the flow of execution of tasks per play, the default will be the same as before
+ * New strategy plugins, allow to control the flow of execution of tasks per play, the default will be the same as before
  * Improved error handling, now you get much more detailed parser messages. General exception handling and display has been revamped.
  * Task includes now get evaluated during execution, end behaviour will be the same but it now allows for more dynamic includes and options.
- * First feature of the more dynamic includes is that with_ loops are now usable with them.
+ * First feature of the more dynamic includes is that "with\_<lookup>" loops are now usable with them.
  * callback, connection and lookup plugin APIs have changed, some will require modification to work with new version
  * callbacks are now shipped in the active directory and don't need to be copied, just whitelisted in ansible.cfg
  * Many API changes, this will break those currently using it directly, but the new API is much easier to use and test
- * Settings are now more inheritable, what you set at play, block or role will be automatically inhertited by the contained,
-   this allows for new feautures to automatically be settable at all levels, previouslly we had to manually code this
- * Many more tests, new API makes things more testable and we took advantage of it
- * big_ip modules now support turning off ssl certificate validation (use only for self signed)
- * template code now retains types for bools and Numbers instead of turning them into strings
+ * Settings are now more inheritable, what you set at play, block or role will be automatically inhertited by the contained.
+   This allows for new features to automatically be settable at all levels, previously we had to manually code this
+ * template code now retains types for bools and numbers instead of turning them into strings.
    If you need the old behaviour, quote the value and it will get passed around as a string
+ * added meta: refresh_inventory to force rereading the inventory in a play
+ * vars are now settable at play, block, role and task level
+ * template code now retains types for bools, and Numbers instead of turning them into strings
+   If you need the old behaviour, quote the value and it will get passed around as a string. In the
+   case of nulls, the output used to be an empty string.
+ * Empty variables and variables set to null in yaml will no longer be converted to empty strings.
+   They will retain the value of `None`.  To go back to the old behaviour, you can override
+   the `null_representation` setting to an empty string in your config file or by setting the
+   `ANSIBLE_NULL_REPRESENTATION` environment variable.
 
 Deprecated Modules (new ones in parens):
   * ec2_ami_search (ec2_ami_find)
@@ -31,13 +38,23 @@ New Modules:
   * amazon: ec2_ami_find
   * amazon: ec2_eni
   * amazon: ec2_eni_facts
+  * amazon: ec2_remote_facts
   * amazon: ec2_vpc_net
+  * amazon: ec2_vpc_route_table_facts
+  * amazon: ec2_vpc_subnet
   * amazon: ec2_win_password
   * amazon: elasticache_subnet_group
   * amazon: iam
   * amazon: iam_policy
   * amazon: route53_zone
+  * amazon: sts_assume_role
+  * amazon: s3_logging
+  * apk
   * bundler
+  * centurylink: clc_loadbalancer
+  * centurylink: clc_modify_server
+  * centurylink: clc_publicip
+  * centurylink: clc_server
   * circonus_annotation
   * consul
   * consul_acl
@@ -46,24 +63,30 @@ New Modules:
   * cloudtrail
   * cloudstack: cs_account
   * cloudstack: cs_affinitygroup
+  * cloudstack: cs_domain
   * cloudstack: cs_facts
   * cloudstack: cs_firewall
   * cloudstack: cs_iso
   * cloudstack: cs_instance
   * cloudstack: cs_instancegroup
+  * cloudstack: cs_ip_address
   * cloudstack: cs_network
   * cloudstack: cs_portforward
   * cloudstack: cs_project
   * cloudstack: cs_sshkeypair
   * cloudstack: cs_securitygroup
   * cloudstack: cs_securitygroup_rule
+  * cloudstack: cs_staticnat
   * cloudstack: cs_template
   * cloudstack: cs_vmsnapshot
   * datadog_monitor
   * dpkg_selections
+  * elasticsearch_plugin
   * expect
   * find
   * hall
+  * libvirt: virt_net
+  * libvirt: virt_pool
   * maven_artifact
   * openstack: os_ironic
   * openstack: os_ironic_node
@@ -71,6 +94,7 @@ New Modules:
   * openstack: os_floating_ip
   * openstack: os_image
   * openstack: os_network
+  * openstack: os_nova_flavor
   * openstack: os_object
   * openstack: os_security_group
   * openstack: os_security_group_rule
@@ -81,7 +105,12 @@ New Modules:
   * openstack: os_subnet
   * openstack: os_volume
   * osx_defaults
+  * pam_limits
   * pear
+  * profitbricks: profitbricks
+  * profitbricks: profitbricks_datacenter
+  * profitbricks: profitbricks_nic
+  * profitbricks: profitbricks_volume
   * proxmox
   * proxmox_template 
   * puppet 
@@ -95,15 +124,21 @@ New Modules:
   * rabbitmq_binding
   * rabbitmq_exchange
   * rabbitmq_queue
+  * selinux_permissive
   * sensu_check
   * sensu_subscription
+  * seport
+  * slackpkg
+  * solaris_zone
   * vertica_configuration
   * vertica_facts
   * vertica_role
   * vertica_schema
   * vertica_user
-  * vmware_datacenter
-  * vsphere_copy
+  * vmware: vmware_datacenter
+  * vmware: vca_fw
+  * vmware: vca_nat
+  * vmware: vsphere_copy
   * webfaction_app
   * webfaction_db
   * webfaction_domain
@@ -117,16 +152,38 @@ New Modules:
   * win_iis_webbinding
   * win_iis_website
   * win_regedit
+  * win_unzip
+  * xenserver_facts
   * zabbix_host
   * zabbix_hostmacro
   * zabbix_screen
+  * znode
 
 New Inventory scripts:
   * cloudstack
   * fleetctl
+  * openvz
+  * proxmox
   * serf
 
-Other Notable Changes:
+New Lookups:
+ * credstash
+ * hashi_vault
+ * ini
+ * shelvefile
+
+Minor changes:
+
+ * Many more tests, new API makes things more testable and we took advantage of it
+ * big_ip modules now support turning off ssl certificate validation (use only for self signed)
+ * The undocumented semicolon-separated "pattern1;pattern2" syntax to match hosts is no longer supported.
+ * Now when you delegate a action that returns ansible_facts, these facts will now be applied to the delegated host,
+   unlike before which they were applied to the current host.
+ * Consolidated code from modules using urllib2 to normalize features, TLS and SNI support
+ * synchronize module's dest_port parameter now takes precedence over the ansible_ssh_port inventory setting
+ * play output is now dynamically sized to terminal with a minimal of 80 coluumns (old default)
+ * vars_prompt and pause are now skipped with a warning if the play is called non interactively (i.e. pull from cron)
+ * Support for OpenBSD's 'doas' privilege escalation method.
 
 ## 1.9.2 "Dancing In the Street" - Jun 26, 2015
 
@@ -404,7 +461,7 @@ And various other bug fixes and improvements ...
 - Fixes a bug in vault where the password file option was not being used correctly internally.
 - Improved multi-line parsing when using YAML literal blocks (using > or |).
 - Fixed a bug with the file module and the creation of relative symlinks.
-- Fixed a bug where checkmode was not being honored during the templating of files.
+- Fixed a bug where checkmode was not being honoured during the templating of files.
 - Other various bug fixes.
 
 ## 1.7.1 "Summer Nights" - Aug 14, 2014
@@ -447,7 +504,7 @@ New Modules:
 Other notable changes:
 
 * Security fixes
-  - Prevent the use of lookups when using legaxy "{{ }}" syntax around variables and with_* loops.
+  - Prevent the use of lookups when using legacy "{{ }}" syntax around variables and with_* loops.
   - Remove relative paths in TAR-archived file names used by ansible-galaxy.
 * Inventory speed improvements for very large inventories.
 * Vault password files can now be executable, to support scripts that fetch the vault password.
@@ -1124,7 +1181,7 @@ the variable is still registered for the host, with the attribute skipped: True.
 * service pattern argument now correctly read for BSD services
 * fetch location can now be controlled more directly via the 'flat' parameter.
 * added basename and dirname as Jinja2 filters available to all templates
-* pip works better when sudoing from unpriveledged users
+* pip works better when sudoing from unprivileged users
 * fix for user creation with groups specification reporting 'changed' incorrectly in some cases
 * fix for some unicode encoding errors in outputing some data in verbose mode
 * improved FreeBSD, NetBSD and Solaris facts

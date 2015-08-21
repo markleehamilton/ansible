@@ -26,12 +26,11 @@ from ansible.errors import AnsibleError, AnsibleParserError
 from ansible.playbook.attribute import Attribute, FieldAttribute
 from ansible.playbook.base import Base
 from ansible.playbook.become import Become
+from ansible.playbook.block import Block
 from ansible.playbook.helpers import load_list_of_blocks, load_list_of_roles
 from ansible.playbook.role import Role
 from ansible.playbook.taggable import Taggable
-from ansible.playbook.block import Block
-
-from ansible.utils.vars import combine_vars
+from ansible.playbook.task import Task
 
 
 __all__ = ['Play']
@@ -58,7 +57,7 @@ class Play(Base, Taggable, Become):
     _accelerate_port     = FieldAttribute(isa='int', default=5099) # should be alias of port
 
     # Connection
-    _gather_facts        = FieldAttribute(isa='string', default='smart')
+    _gather_facts        = FieldAttribute(isa='bool', default=None)
     _hosts               = FieldAttribute(isa='list', default=[], required=True, listof=string_types)
     _name                = FieldAttribute(isa='string', default='')
 
@@ -67,17 +66,18 @@ class Play(Base, Taggable, Become):
     _vars_prompt         = FieldAttribute(isa='list', default=[])
     _vault_password      = FieldAttribute(isa='string')
 
+    # Role Attributes
+    _roles               = FieldAttribute(isa='list', default=[], priority=100)
+
     # Block (Task) Lists Attributes
     _handlers            = FieldAttribute(isa='list', default=[])
     _pre_tasks           = FieldAttribute(isa='list', default=[])
     _post_tasks          = FieldAttribute(isa='list', default=[])
     _tasks               = FieldAttribute(isa='list', default=[])
 
-    # Role Attributes
-    _roles               = FieldAttribute(isa='list', default=[])
-
     # Flag/Setting Attributes
     _any_errors_fatal    = FieldAttribute(isa='bool', default=False)
+    _force_handlers      = FieldAttribute(isa='bool')
     _max_fail_percentage = FieldAttribute(isa='string', default='0')
     _serial              = FieldAttribute(isa='int', default=0)
     _strategy            = FieldAttribute(isa='string', default='linear')
@@ -87,12 +87,14 @@ class Play(Base, Taggable, Become):
     def __init__(self):
         super(Play, self).__init__()
 
+        self.ROLE_CACHE = {}
+
     def __repr__(self):
         return self.get_name()
 
     def get_name(self):
        ''' return the name of the Play '''
-       return "PLAY: %s" % self._attributes.get('name')
+       return self._attributes.get('name')
 
     @staticmethod
     def load(data, variable_manager=None, loader=None):
@@ -145,30 +147,6 @@ class Play(Base, Taggable, Become):
 
         return ds
 
-    def _load_vars(self, attr, ds):
-        '''
-        Vars in a play can be specified either as a dictionary directly, or
-        as a list of dictionaries. If the later, this method will turn the
-        list into a single dictionary.
-        '''
-
-        try:
-            if isinstance(ds, dict):
-                return ds
-            elif isinstance(ds, list):
-                all_vars = dict()
-                for item in ds:
-                    if not isinstance(item, dict):
-                        raise ValueError
-                    all_vars = combine_vars(all_vars, item)
-                return all_vars
-            elif ds is None:
-                return {}
-            else:
-                raise ValueError
-        except ValueError:
-            raise AnsibleParserError("Vars in a playbook must be specified as a dictionary, or a list of dictionaries", obj=ds)
-
     def _load_tasks(self, attr, ds):
         '''
         Loads a list of blocks from a list which may be mixed tasks/blocks.
@@ -206,11 +184,11 @@ class Play(Base, Taggable, Become):
         if ds is None:
             ds = []
 
-        role_includes = load_list_of_roles(ds, variable_manager=self._variable_manager, loader=self._loader)
+        role_includes = load_list_of_roles(ds, play=self, variable_manager=self._variable_manager, loader=self._loader)
 
         roles = []
         for ri in role_includes:
-            roles.append(Role.load(ri))
+            roles.append(Role.load(ri, play=self))
         return roles
 
     def _post_validate_vars(self, attr, value, templar):
@@ -225,6 +203,14 @@ class Play(Base, Taggable, Become):
         Override post validation of vars_files on the play, as we don't want to
         template these too early.
         '''
+        return value
+
+    # disable validation on various fields which will be validated later in other objects
+    def _post_validate_become(self, attr, value, templar):
+        return value
+    def _post_validate_become_user(self, attr, value, templar):
+        return value
+    def _post_validate_become_method(self, attr, value, templar):
         return value
 
     # FIXME: post_validation needs to ensure that become/su/sudo have only 1 set
@@ -267,12 +253,25 @@ class Play(Base, Taggable, Become):
         tasks specified in the play.
         '''
 
+        # create a block containing a single flush handlers meta
+        # task, so we can be sure to run handlers at certain points
+        # of the playbook execution
+        flush_block = Block.load(
+            data={'meta': 'flush_handlers'},
+            play=self,
+            variable_manager=self._variable_manager,
+            loader=self._loader
+        )
+
         block_list = []
 
         block_list.extend(self.pre_tasks)
+        block_list.append(flush_block)
         block_list.extend(self._compile_roles())
         block_list.extend(self.tasks)
+        block_list.append(flush_block)
         block_list.extend(self.post_tasks)
+        block_list.append(flush_block)
 
         return block_list
 
@@ -320,4 +319,9 @@ class Play(Base, Taggable, Become):
 
             setattr(self, 'roles', roles)
             del data['roles']
+
+    def copy(self):
+        new_me = super(Play, self).copy()
+        new_me.ROLE_CACHE = self.ROLE_CACHE.copy()
+        return new_me
 

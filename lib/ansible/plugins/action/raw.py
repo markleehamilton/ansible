@@ -19,12 +19,14 @@ __metaclass__ = type
 
 from ansible.plugins.action import ActionBase
 
+import re
+
 class ActionModule(ActionBase):
     TRANSFERS_FILES = False
 
     def run(self, tmp=None, task_vars=dict()):
 
-        if self._connection_info.check_mode:
+        if self._play_context.check_mode:
             # in --check mode, always skip this module execution
             return dict(skipped=True)
 
@@ -34,7 +36,7 @@ class ActionModule(ActionBase):
         # for some modules (script, raw), the sudo success key
         # may leak into the stdout due to the way the sudo/su
         # command is constructed, so we filter that out here
-        if result.get('stdout','').strip().startswith('SUDO-SUCCESS-'):
-            result['stdout'] = re.sub(r'^((\r)?\n)?SUDO-SUCCESS.*(\r)?\n', '', result['stdout'])
+        if result.get('stdout','').strip().startswith('BECOME-SUCCESS-'):
+            result['stdout'] = re.sub(r'^((\r)?\n)?BECOME-SUCCESS.*(\r)?\n', '', result['stdout'])
 
         return result

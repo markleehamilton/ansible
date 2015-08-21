@@ -73,7 +73,7 @@ class DocCLI(CLI):
             for path in paths:
                 self.find_modules(path)
 
-            CLI.pager(self.get_module_list_text())
+            self.pager(self.get_module_list_text())
             return 0
 
         if len(self.args) == 0:
@@ -122,9 +122,10 @@ class DocCLI(CLI):
                     # probably a quoting issue.
                     raise AnsibleError("Parsing produced an empty object.")
             except Exception, e:
+                self.display.vvv(traceback.print_exc())
                 raise AnsibleError("module %s missing documentation (or could not parse documentation): %s\n" % (module, str(e)))
 
-        CLI.pager(text)
+        self.pager(text)
         return 0
 
     def find_modules(self, path):
@@ -283,6 +284,22 @@ class DocCLI(CLI):
         if 'returndocs' in doc and doc['returndocs'] is not None:
             text.append("RETURN VALUES:")
             text.append(doc['returndocs'])
+        text.append('')
+
+        maintainers = set()
+        if 'author' in doc:
+            if isinstance(doc['author'], basestring):
+                maintainers.add(doc['author'])
+            else:
+                maintainers.update(doc['author'])
+
+        if 'maintainers' in doc:
+            if isinstance(doc['maintainers'], basestring):
+                maintainers.add(doc['author'])
+            else:
+                maintainers.update(doc['author'])
+
+        text.append('MAINTAINERS: ' + ', '.join(maintainers))
         text.append('')
 
         return "\n".join(text)

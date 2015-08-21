@@ -40,7 +40,14 @@ class TaskResult:
         return self._check_key('changed')
 
     def is_skipped(self):
-        return self._check_key('skipped')
+        if 'results' in self._result and self._task.loop:
+            flag = True
+            for res in self._result.get('results', []):
+                if isinstance(res, dict):
+                    flag &= res.get('skipped', False)
+            return flag
+        else:
+            return self._result.get('skipped', False)
 
     def is_failed(self):
         if 'failed_when_result' in self._result or \
@@ -53,7 +60,7 @@ class TaskResult:
         return self._check_key('unreachable')
 
     def _check_key(self, key):
-        if 'results' in self._result:
+        if 'results' in self._result and self._task.loop:
             flag = False
             for res in self._result.get('results', []):
                 if isinstance(res, dict):

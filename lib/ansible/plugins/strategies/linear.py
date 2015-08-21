@@ -27,7 +27,6 @@ from ansible.playbook.task import Task
 from ansible.plugins import action_loader
 from ansible.plugins.strategies import StrategyBase
 from ansible.template import Templar
-from ansible.utils.debug import debug
 
 class StrategyModule(StrategyBase):
 
@@ -59,6 +58,9 @@ class StrategyModule(StrategyBase):
                 continue
 
             (s, t) = v
+            if t is None:
+                continue
+
             if s.cur_block < lowest_cur_block and s.run_state != PlayIterator.ITERATING_COMPLETE:
                 lowest_cur_block = s.cur_block
 
@@ -82,15 +84,21 @@ class StrategyModule(StrategyBase):
             # specified in the given hosts array
             rvals = []
             for host in hosts:
-                (s, t) = host_tasks[host.name]
+                host_state_task = host_tasks[host.name]
+                if host_state_task is None:
+                    continue
+                (s, t) = host_state_task
+                if t is None:
+                    continue
                 if s.run_state == cur_state and s.cur_block == cur_block:
                     new_t = iterator.get_next_task_for_host(host)
                     #if new_t != t:
-                    #    raise AnsibleError("iterator error, wtf?")
+                    #    raise AnsibleError("iterator error, wtf?") FIXME
                     rvals.append((host, t))
                 else:
                     rvals.append((host, noop_task))
             return rvals
+
 
         # if any hosts are in ITERATING_SETUP, return the setup task
         # while all other hosts get a noop
@@ -116,7 +124,7 @@ class StrategyModule(StrategyBase):
         # return None for all hosts in the list
         return [(host, None) for host in hosts]
 
-    def run(self, iterator, connection_info):
+    def run(self, iterator, play_context):
         '''
         The linear strategy is simple - get the next task and queue
         it for all hosts, then wait for the queue to drain before
@@ -129,9 +137,9 @@ class StrategyModule(StrategyBase):
         while work_to_do and not self._tqm._terminated:
 
             try:
-                debug("getting the remaining hosts for this loop")
+                self._display.debug("getting the remaining hosts for this loop")
                 hosts_left = self._inventory.get_hosts(iterator._play.hosts)
-                debug("done getting the remaining hosts for this loop")
+                self._display.debug("done getting the remaining hosts for this loop")
 
                 # queue up this task for each host in the inventory
                 callback_sent = False
@@ -140,12 +148,17 @@ class StrategyModule(StrategyBase):
                 host_results = []
                 host_tasks = self._get_next_task_lockstep(hosts_left, iterator)
 
+                # skip control
+                skip_rest   = False
+                choose_step = True
+
                 for (host, task) in host_tasks:
                     if not task:
                         continue
 
                     run_once = False
                     work_to_do = True
+
 
                     # test to see if the task across all hosts points to an action plugin which
                     # sets BYPASS_HOST_LOOP to true, or if it has run_once enabled. If so, we
@@ -162,39 +175,43 @@ class StrategyModule(StrategyBase):
 
                     # check to see if this task should be skipped, due to it being a member of a
                     # role which has already run (and whether that role allows duplicate execution)
-                    if task._role and task._role.has_run():
+                    if task._role and task._role.has_run(host):
                         # If there is no metadata, the default behavior is to not allow duplicates,
                         # if there is metadata, check to see if the allow_duplicates flag was set to true
                         if task._role._metadata is None or task._role._metadata and not task._role._metadata.allow_duplicates:
-                            debug("'%s' skipped because role has already run" % task)
+                            self._display.debug("'%s' skipped because role has already run" % task)
                             continue
 
                     if task.action == 'meta':
-                        # meta tasks store their args in the _raw_params field of args,
-                        # since they do not use k=v pairs, so get that
-                        meta_action = task.args.get('_raw_params')
-                        if meta_action == 'noop':
-                            # FIXME: issue a callback for the noop here?
-                            continue
-                        elif meta_action == 'flush_handlers':
-                            self.run_handlers(iterator, connection_info)
-                        else:
-                            raise AnsibleError("invalid meta action requested: %s" % meta_action, obj=task._ds)
+                        self._execute_meta(task, play_context, iterator)
                     else:
-                        debug("getting variables")
+                        # handle step if needed, skip meta actions as they are used internally
+                        if self._step and choose_step:
+                            if self._take_step(task):
+                                choose_step = False
+                            else:
+                                skip_rest = True
+                                break
+
+                        self._display.debug("getting variables")
                         task_vars = self._variable_manager.get_vars(loader=self._loader, play=iterator._play, host=host, task=task)
                         task_vars = self.add_tqm_variables(task_vars, play=iterator._play)
                         templar = Templar(loader=self._loader, variables=task_vars)
-                        debug("done getting variables")
+                        self._display.debug("done getting variables")
 
                         if not callback_sent:
                             temp_task = task.copy()
-                            temp_task.name = templar.template(temp_task.get_name(), fail_on_undefined=False)
+                            try:
+                                temp_task.name = unicode(templar.template(temp_task.name, fail_on_undefined=False))
+                            except:
+                                # just ignore any errors during task name templating,
+                                # we don't care if it just shows the raw name
+                                pass
                             self._tqm.send_callback('v2_playbook_on_task_start', temp_task, is_conditional=False)
                             callback_sent = True
 
                         self._blocked_hosts[host.get_name()] = True
-                        self._queue_task(host, task, task_vars, connection_info)
+                        self._queue_task(host, task, task_vars, play_context)
 
                     results = self._process_pending_results(iterator)
                     host_results.extend(results)
@@ -203,12 +220,16 @@ class StrategyModule(StrategyBase):
                     if run_once:
                         break
 
-                debug("done queuing things up, now waiting for results queue to drain")
+                # go to next host/task group
+                if skip_rest:
+                    continue
+
+                self._display.debug("done queuing things up, now waiting for results queue to drain")
                 results = self._wait_on_pending_results(iterator)
                 host_results.extend(results)
 
                 if not work_to_do and len(iterator.get_failed_hosts()) > 0:
-                    debug("out of hosts to run on")
+                    self._display.debug("out of hosts to run on")
                     self._tqm.send_callback('v2_playbook_on_no_hosts_remaining')
                     result = False
                     break
@@ -233,8 +254,7 @@ class StrategyModule(StrategyBase):
                         except AnsibleError, e:
                             for host in included_file._hosts:
                                 iterator.mark_host_failed(host)
-                            # FIXME: callback here?
-                            print(e)
+                            self._display.warning(str(e))
                             continue
 
                         for new_block in new_blocks:
@@ -245,7 +265,7 @@ class StrategyModule(StrategyBase):
                             for host in hosts_left:
                                 if host in included_file._hosts:
                                     task_vars = self._variable_manager.get_vars(loader=self._loader, play=iterator._play, host=host, task=included_file._task)
-                                    final_block = new_block.filter_tagged_tasks(connection_info, task_vars)
+                                    final_block = new_block.filter_tagged_tasks(play_context, task_vars)
                                     all_blocks[host].append(final_block)
                                 else:
                                     all_blocks[host].append(noop_block)
@@ -253,14 +273,14 @@ class StrategyModule(StrategyBase):
                     for host in hosts_left:
                         iterator.add_tasks(host, all_blocks[host])
 
-                debug("results queue empty")
+                self._display.debug("results queue empty")
             except (IOError, EOFError), e:
-                debug("got IOError/EOFError in task loop: %s" % e)
+                self._display.debug("got IOError/EOFError in task loop: %s" % e)
                 # most likely an abort, return failed
                 return False
 
         # run the base class run() method, which executes the cleanup function
         # and runs any outstanding handlers which have been triggered
 
-        return super(StrategyModule, self).run(iterator, connection_info, result)
+        return super(StrategyModule, self).run(iterator, play_context, result)
 

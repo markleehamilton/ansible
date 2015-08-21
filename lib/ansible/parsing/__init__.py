@@ -19,6 +19,7 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
+import copy
 import json
 import os
 
@@ -31,6 +32,7 @@ from ansible.parsing.splitter import unquote
 from ansible.parsing.yaml.loader import AnsibleLoader
 from ansible.parsing.yaml.objects import AnsibleBaseYAMLObject, AnsibleUnicode
 from ansible.utils.path import unfrackpath
+from ansible.utils.unicode import to_unicode
 
 class DataLoader():
 
@@ -99,27 +101,32 @@ class DataLoader():
         # if the file has already been read in and cached, we'll
         # return those results to avoid more file/vault operations
         if file_name in self._FILE_CACHE:
-            return self._FILE_CACHE[file_name]
+            parsed_data = self._FILE_CACHE[file_name]
+        else:
+            # read the file contents and load the data structure from them
+            (file_data, show_content) = self._get_file_contents(file_name)
+            parsed_data = self.load(data=file_data, file_name=file_name, show_content=show_content)
 
-        # read the file contents and load the data structure from them
-        (file_data, show_content) = self._get_file_contents(file_name)
-        parsed_data = self.load(data=file_data, file_name=file_name, show_content=show_content)
+            # cache the file contents for next time
+            self._FILE_CACHE[file_name] = parsed_data
 
-        # cache the file contents for next time
-        self._FILE_CACHE[file_name] = parsed_data
-
-        return parsed_data
+        # return a deep copy here, so the cache is not affected
+        return copy.deepcopy(parsed_data)
 
     def path_exists(self, path):
+        path = self.path_dwim(path)
         return os.path.exists(path)
 
     def is_file(self, path):
+        path = self.path_dwim(path)
         return os.path.isfile(path)
 
     def is_directory(self, path):
+        path = self.path_dwim(path)
         return os.path.isdir(path)
 
     def list_directory(self, path):
+        path = self.path_dwim(path)
         return os.listdir(path)
 
     def _safe_load(self, stream, file_name=None):
@@ -136,6 +143,8 @@ class DataLoader():
         Reads the file contents from the given file name, and will decrypt them
         if they are found to be vault-encrypted.
         '''
+        if not file_name or not isinstance(file_name, basestring):
+            raise AnsibleParserError("Invalid filename: '%s'" % str(file_name))
 
         if not self.path_exists(file_name) or not self.is_file(file_name):
             raise AnsibleParserError("the file_name '%s' does not exist, or is not readable" % file_name)
@@ -175,7 +184,7 @@ class DataLoader():
         ''' sets the base directory, used to find files when a relative path is given '''
 
         if basedir is not None:
-            self._basedir = basedir
+            self._basedir = to_unicode(basedir)
 
     def path_dwim(self, given):
         '''
@@ -191,32 +200,48 @@ class DataLoader():
         else:
             return os.path.abspath(os.path.join(self._basedir, given))
 
-    def path_dwim_relative(self, role_path, dirname, source):
-        ''' find one file in a directory one level up in a dir named dirname relative to current '''
+    def path_dwim_relative(self, path, dirname, source):
+        ''' find one file in a role/playbook dirs with/without dirname subdir '''
 
-        basedir = os.path.dirname(role_path)
-        if os.path.islink(basedir):
-            basedir = unfrackpath(basedir)
-            template2 = os.path.join(basedir, dirname, source)
+        search = []
+        isrole = False
+
+        # I have full path, nothing else needs to be looked at
+        if source.startswith('~') or source.startswith('/'):
+            search.append(self.path_dwim(source))
         else:
-            template2 = os.path.join(basedir, '..', dirname, source)
+            # base role/play path + templates/files/vars + relative filename
+            search.append(os.path.join(path, dirname, source))
 
-        source1 = os.path.join(role_path, dirname, source)
-        if os.path.exists(source1):
-            return source1
+            basedir = unfrackpath(path)
 
-        cur_basedir = self._basedir
-        self.set_basedir(basedir)
-        source2 = self.path_dwim(template2)
-        if os.path.exists(source2):
+            # is it a role and if so make sure you get correct base path
+            if path.endswith('tasks') and os.path.exists(os.path.join(path,'main.yml')) \
+                or os.path.exists(os.path.join(path,'tasks/main.yml')):
+                isrole = True
+                if path.endswith('tasks'):
+                    basedir = unfrackpath(os.path.dirname(path))
+
+            cur_basedir = self._basedir
+            self.set_basedir(basedir)
+            # resolved base role/play path + templates/files/vars + relative filename
+            search.append(self.path_dwim(os.path.join(basedir, dirname, source)))
             self.set_basedir(cur_basedir)
-            return source2
-        self.set_basedir(cur_basedir)
 
-        obvious_local_path = self.path_dwim(source)
-        if os.path.exists(obvious_local_path):
-            #self.set_basedir(cur_basedir)
-            return obvious_local_path
+            if isrole and not source.endswith(dirname):
+                # look in role's tasks dir w/o dirname
+                search.append(self.path_dwim(os.path.join(basedir, 'tasks', source)))
 
-        return source2
+            # try to create absolute path for loader basedir + templates/files/vars + filename
+            search.append(self.path_dwim(os.path.join(dirname,source)))
+            search.append(self.path_dwim(os.path.join(basedir, source)))
+
+            # try to create absolute path for loader basedir + filename
+            search.append(self.path_dwim(source))
+
+        for candidate in search:
+            if os.path.exists(candidate):
+                break
+
+        return candidate
 

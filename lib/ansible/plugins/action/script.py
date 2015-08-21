@@ -28,7 +28,7 @@ class ActionModule(ActionBase):
     def run(self, tmp=None, task_vars=None):
         ''' handler for file transfer operations '''
 
-        if self._connection_info.check_mode:
+        if self._play_context.check_mode:
             return dict(skipped=True, msg='check mode not supported for this module')
 
         if not tmp:
@@ -65,7 +65,7 @@ class ActionModule(ActionBase):
         if self._task._role is not None:
             source = self._loader.path_dwim_relative(self._task._role._role_path, 'files', source)
         else:
-            source = self._loader.path_dwim(source)
+            source = self._loader.path_dwim_relative(self._loader.get_basedir(), 'files', source)
 
         # transfer the file to a remote tmp location
         tmp_src = self._connection._shell.join_path(tmp, os.path.basename(source))
@@ -73,7 +73,7 @@ class ActionModule(ActionBase):
 
         sudoable = True
         # set file permissions, more permissive when the copy is done as a different user
-        if self._connection_info.become and self._connection_info.become_user != 'root':
+        if self._play_context.become and self._play_context.become_user != 'root':
             chmod_mode = 'a+rx'
             sudoable = False
         else:
@@ -83,8 +83,8 @@ class ActionModule(ActionBase):
         # add preparation steps to one ssh roundtrip executing the script
         env_string = self._compute_environment_string()
         script_cmd = ' '.join([env_string, tmp_src, args])
-        
-        result = self._low_level_execute_command(cmd=script_cmd, tmp=None, sudoable=sudoable)
+
+        result = self._low_level_execute_command(cmd=script_cmd, tmp=None, sudoable=True)
 
         # clean up after
         if tmp and "tmp" in tmp and not C.DEFAULT_KEEP_REMOTE_FILES:

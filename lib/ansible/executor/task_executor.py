@@ -26,11 +26,10 @@ import sys
 import time
 
 from ansible import constants as C
-from ansible.errors import AnsibleError, AnsibleParserError
-from ansible.executor.connection_info import ConnectionInformation
+from ansible.errors import AnsibleError, AnsibleParserError, AnsibleUndefinedVariable
 from ansible.playbook.conditional import Conditional
 from ansible.playbook.task import Task
-from ansible.plugins import lookup_loader, connection_loader, action_loader
+from ansible.plugins import connection_loader, action_loader
 from ansible.template import Templar
 from ansible.utils.listify import listify_lookup_plugin_terms
 from ansible.utils.unicode import to_unicode
@@ -52,14 +51,21 @@ class TaskExecutor:
     # the module
     SQUASH_ACTIONS = frozenset(('apt', 'yum', 'pkgng', 'zypper', 'dnf'))
 
-    def __init__(self, host, task, job_vars, connection_info, new_stdin, loader, shared_loader_obj):
+    def __init__(self, host, task, job_vars, play_context, new_stdin, loader, shared_loader_obj):
         self._host              = host
         self._task              = task
         self._job_vars          = job_vars
-        self._connection_info   = connection_info
+        self._play_context      = play_context
         self._new_stdin         = new_stdin
         self._loader            = loader
         self._shared_loader_obj = shared_loader_obj
+
+        try:
+            from __main__ import display
+            self._display = display
+        except ImportError:
+            from ansible.utils.display import Display
+            self._display = Display()
 
     def run(self):
         '''
@@ -121,6 +127,13 @@ class TaskExecutor:
             return result
         except AnsibleError, e:
             return dict(failed=True, msg=to_unicode(e, nonstring='simplerepr'))
+        finally:
+            try:
+                self._connection.close()
+            except AttributeError:
+                pass
+            except Exception, e:
+                debug("error closing connection: %s" % to_unicode(e))
 
     def _get_loop_items(self):
         '''
@@ -128,10 +141,30 @@ class TaskExecutor:
         and returns the items result.
         '''
 
+        # create a copy of the job vars here so that we can modify
+        # them temporarily without changing them too early for other
+        # parts of the code that might still need a pristine version
+        vars_copy = self._job_vars.copy()
+
+        # now we update them with the play context vars
+        self._play_context.update_vars(vars_copy)
+
+        templar = Templar(loader=self._loader, shared_loader_obj=self._shared_loader_obj, variables=vars_copy)
         items = None
-        if self._task.loop and self._task.loop in lookup_loader:
-            loop_terms = listify_lookup_plugin_terms(terms=self._task.loop_args, variables=self._job_vars, loader=self._loader)
-            items = lookup_loader.get(self._task.loop, loader=self._loader).run(terms=loop_terms, variables=self._job_vars)
+        if self._task.loop:
+            if self._task.loop in self._shared_loader_obj.lookup_loader:
+                #TODO: remove convert_bare true and deprecate this in with_ 
+                try:
+                    loop_terms = listify_lookup_plugin_terms(terms=self._task.loop_args, templar=templar, loader=self._loader, fail_on_undefined=True, convert_bare=True)
+                except AnsibleUndefinedVariable as e:
+                    if 'has no attribute' in str(e):
+                        loop_terms = []
+                        self._display.deprecated("Skipping task due to undefined attribute, in the future this will be a fatal error.")
+                    else:
+                        raise
+                items = self._shared_loader_obj.lookup_loader.get(self._task.loop, loader=self._loader, templar=templar).run(terms=loop_terms, variables=vars_copy)
+            else:
+                raise AnsibleError("Unexpected failure in finding the lookup named '%s' in the available lookup plugins" % self._task.loop)
 
         return items
 
@@ -168,9 +201,6 @@ class TaskExecutor:
             # to the list of results
             res['item'] = item
             results.append(res)
-
-            # FIXME: we should be sending back a callback result for each item in the loop here
-            print(res)
 
         return results
 
@@ -211,11 +241,11 @@ class TaskExecutor:
 
         # fields set from the play/task may be based on variables, so we have to
         # do the same kind of post validation step on it here before we use it.
-        self._connection_info.post_validate(templar=templar)
+        self._play_context.post_validate(templar=templar)
 
-        # now that the connection information is finalized, we can add 'magic'
+        # now that the play context is finalized, we can add 'magic'
         # variables to the variable dictionary
-        self._connection_info.update_vars(variables)
+        self._play_context.update_vars(variables)
 
         # Evaluate the conditional (if any) for this task, which we do before running
         # the final task post-validation. We do this before the post validation due to
@@ -233,6 +263,12 @@ class TaskExecutor:
             prev_var = self._task.args.pop('var')
 
         self._task.post_validate(templar=templar)
+        if '_variable_params' in self._task.args:
+            variable_params = self._task.args.pop('_variable_params')
+            if isinstance(variable_params, dict):
+                self._display.deprecated("Using variables for task params is unsafe, especially if the variables come from an external source like facts")
+                variable_params.update(self._task.args)
+                self._task.args = variable_params
 
         if prev_var is not None:
             self._task.args['var'] = prev_var
@@ -243,7 +279,7 @@ class TaskExecutor:
             include_variables = self._task.args.copy()
             include_file = include_variables.get('_raw_params')
             del include_variables['_raw_params']
-            return dict(changed=True, include=include_file, include_variables=include_variables)
+            return dict(include=include_file, include_variables=include_variables)
 
         # get the connection and the handler for this execution
         self._connection = self._get_connection(variables)
@@ -286,7 +322,7 @@ class TaskExecutor:
                 # response, so we parse it here and replace the result
                 try:
                     result = json.loads(result.get('stdout'))
-                except ValueError, e:
+                except (TypeError, ValueError) as e:
                     return dict(failed=True, msg="The async task did not return valid JSON: %s" % str(e))
 
                 if self._task.poll > 0:
@@ -318,9 +354,12 @@ class TaskExecutor:
                     result['failed_when_result'] = result['failed'] = failed_when_result
                     if failed_when_result:
                         break
-            elif 'failed' not in result and result.get('rc', 0) == 0:
-                # if the result is not failed, stop trying
-                break
+            elif 'failed' not in result:
+                if result.get('rc', 0) != 0:
+                    result['failed'] = True
+                else:
+                    # if the result is not failed, stop trying
+                    break
 
             if attempt < retries - 1:
                 time.sleep(delay)
@@ -332,6 +371,12 @@ class TaskExecutor:
 
         if 'ansible_facts' in result:
             variables.update(result['ansible_facts'])
+
+        # save the notification target in the result, if it was specified, as
+        # this task may be running in a loop in which case the notification
+        # may be item-specific, ie. "notify: service {{item}}"
+        if self._task.notify is not None:
+            result['_ansible_notify'] = self._task.notify
 
         # and return
         debug("attempt loop complete, returning result")
@@ -359,7 +404,7 @@ class TaskExecutor:
             'normal',
             task=async_task,
             connection=self._connection,
-            connection_info=self._connection_info,
+            play_context=self._play_context,
             loader=self._loader,
             templar=templar,
             shared_loader_obj=self._shared_loader_obj,
@@ -386,31 +431,33 @@ class TaskExecutor:
         correct connection object from the list of connection plugins
         '''
 
-        # FIXME: delegate_to calculation should be done here
         # FIXME: calculation of connection params/auth stuff should be done here
 
-        if not self._connection_info.remote_addr:
-            self._connection_info.remote_addr = self._host.ipv4_address
+        if not self._play_context.remote_addr:
+            self._play_context.remote_addr = self._host.ipv4_address
 
         if self._task.delegate_to is not None:
             self._compute_delegate(variables)
 
-        conn_type = self._connection_info.connection
+        conn_type = self._play_context.connection
         if conn_type == 'smart':
             conn_type = 'ssh'
-            if sys.platform.startswith('darwin') and self._connection_info.password:
+            if sys.platform.startswith('darwin') and self._play_context.password:
                 # due to a current bug in sshpass on OSX, which can trigger
                 # a kernel panic even for non-privileged users, we revert to
                 # paramiko on that OS when a SSH password is specified
                 conn_type = "paramiko"
             else:
                 # see if SSH can support ControlPersist if not use paramiko
-                cmd = subprocess.Popen(['ssh','-o','ControlPersist'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                (out, err) = cmd.communicate()
-                if "Bad configuration option" in err:
+                try:
+                    cmd = subprocess.Popen(['ssh','-o','ControlPersist'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    (out, err) = cmd.communicate()
+                    if "Bad configuration option" in err:
+                        conn_type = "paramiko"
+                except OSError:
                     conn_type = "paramiko"
 
-        connection = connection_loader.get(conn_type, self._connection_info, self._new_stdin)
+        connection = connection_loader.get(conn_type, self._play_context, self._new_stdin)
         if not connection:
             raise AnsibleError("the connection plugin '%s' was not found" % conn_type)
 
@@ -434,7 +481,7 @@ class TaskExecutor:
             handler_name,
             task=self._task,
             connection=connection,
-            connection_info=self._connection_info,
+            play_context=self._play_context,
             loader=self._loader,
             templar=templar,
             shared_loader_obj=self._shared_loader_obj,
@@ -449,30 +496,35 @@ class TaskExecutor:
 
         # get the vars for the delegate by its name
         try:
+            self._display.debug("Delegating to %s" % self._task.delegate_to)
             this_info = variables['hostvars'][self._task.delegate_to]
-        except:
+
+            # get the real ssh_address for the delegate and allow ansible_ssh_host to be templated
+            self._play_context.remote_addr      = this_info.get('ansible_ssh_host', self._task.delegate_to)
+            self._play_context.remote_user      = this_info.get('ansible_remote_user', self._task.remote_user)
+            self._play_context.port             = this_info.get('ansible_ssh_port', self._play_context.port)
+            self._play_context.password         = this_info.get('ansible_ssh_pass', self._play_context.password)
+            self._play_context.private_key_file = this_info.get('ansible_ssh_private_key_file', self._play_context.private_key_file)
+            self._play_context.become_pass      = this_info.get('ansible_sudo_pass', self._play_context.become_pass)
+
+            conn = this_info.get('ansible_connection', self._task.connection)
+            if conn:
+                self._play_context.connection   = conn
+
+        except Exception as e:
             # make sure the inject is empty for non-inventory hosts
             this_info = {}
-
-        # get the real ssh_address for the delegate and allow ansible_ssh_host to be templated
-        #self._connection_info.remote_user      = self._compute_delegate_user(self.delegate_to, delegate['inject'])
-        self._connection_info.remote_addr      = this_info.get('ansible_ssh_host', self._task.delegate_to)
-        self._connection_info.port             = this_info.get('ansible_ssh_port', self._connection_info.port)
-        self._connection_info.password         = this_info.get('ansible_ssh_pass', self._connection_info.password)
-        self._connection_info.private_key_file = this_info.get('ansible_ssh_private_key_file', self._connection_info.private_key_file)
-        self._connection_info.connection       = this_info.get('ansible_connection', C.DEFAULT_TRANSPORT)
-        self._connection_info.become_pass      = this_info.get('ansible_sudo_pass', self._connection_info.become_pass)
-
-        if self._connection_info.remote_addr in ('127.0.0.1', 'localhost'):
-             self._connection_info.connection = 'local'
+            self._display.debug("Delegate due to: %s" % str(e))
 
         # Last chance to get private_key_file from global variables.
         # this is useful if delegated host is not defined in the inventory
-        #if delegate['private_key_file'] is None:
-        #    delegate['private_key_file'] = remote_inject.get('ansible_ssh_private_key_file', None)
+        if self._play_context.private_key_file is None:
+            self._play_context.private_key_file = this_info.get('ansible_ssh_private_key_file', None)
 
-        #if delegate['private_key_file'] is not None:
-        #    delegate['private_key_file'] = os.path.expanduser(delegate['private_key_file'])
+        if self._play_context.private_key_file is None:
+            key = this_info.get('private_key_file', None)
+            if key:
+                self._play_context.private_key_file = os.path.expanduser(key)
 
         for i in this_info:
             if i.startswith("ansible_") and i.endswith("_interpreter"):

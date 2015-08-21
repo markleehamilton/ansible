@@ -19,7 +19,6 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
-from ansible import constants as C
 from ansible.inventory.group import Group
 from ansible.utils.vars import combine_vars
 
@@ -76,10 +75,8 @@ class Host:
         self.ipv4_address = name
         self.ipv6_address = name
 
-        if port and port != C.DEFAULT_REMOTE_PORT:
+        if port:
             self.set_variable('ansible_ssh_port', int(port))
-        else:
-            self.set_variable('ansible_ssh_port', C.DEFAULT_REMOTE_PORT)
 
         self._gathered_facts = False
 
@@ -123,7 +120,6 @@ class Host:
         results = combine_vars(results, self.vars)
         results['inventory_hostname'] = self.name
         results['inventory_hostname_short'] = self.name.split('.')[0]
-        results['ansible_ssh_host'] = self.ipv4_address
         results['group_names'] = sorted([ g.name for g in groups if g.name != 'all'])
         return results
 

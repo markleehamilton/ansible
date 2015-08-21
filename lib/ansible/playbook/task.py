@@ -19,11 +19,13 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
+from six import string_types
+
 from ansible.errors import AnsibleError
 
 from ansible.parsing.mod_args import ModuleArgsParser
 from ansible.parsing.splitter import parse_kv
-from ansible.parsing.yaml.objects import AnsibleBaseYAMLObject, AnsibleMapping
+from ansible.parsing.yaml.objects import AnsibleBaseYAMLObject, AnsibleMapping, AnsibleUnicode
 
 from ansible.plugins import module_loader, lookup_loader
 
@@ -68,16 +70,10 @@ class Task(Base, Conditional, Taggable, Become):
     _failed_when          = FieldAttribute(isa='string')
     _first_available_file = FieldAttribute(isa='list')
     _ignore_errors        = FieldAttribute(isa='bool')
-
     _loop                 = FieldAttribute(isa='string', private=True)
     _loop_args            = FieldAttribute(isa='list', private=True)
     _local_action         = FieldAttribute(isa='string')
-
-    # FIXME: this should not be a Task
-    _meta                 = FieldAttribute(isa='string')
-
     _name                 = FieldAttribute(isa='string', default='')
-
     _notify               = FieldAttribute(isa='list')
     _poll                 = FieldAttribute(isa='int')
     _register             = FieldAttribute(isa='string')
@@ -161,21 +157,39 @@ class Task(Base, Conditional, Taggable, Become):
         # and the delegate_to value from the various possible forms
         # supported as legacy
         args_parser = ModuleArgsParser(task_ds=ds)
-        (action, args, delegate_to) = args_parser.parse()
+        (action, args, connection) = args_parser.parse()
 
         new_ds['action']      = action
         new_ds['args']        = args
-        new_ds['delegate_to'] = delegate_to
+        new_ds['connection'] = connection
+
+        # we handle any 'vars' specified in the ds here, as we may
+        # be adding things to them below (special handling for includes).
+        # When that deprecated feature is removed, this can be too.
+        if 'vars' in ds:
+            # _load_vars is defined in Base, and is used to load a dictionary
+            # or list of dictionaries in a standard way
+            new_ds['vars'] = self._load_vars(None, ds.pop('vars'))
+        else:
+            new_ds['vars'] = dict()
 
         for (k,v) in ds.iteritems():
-            if k in ('action', 'local_action', 'args', 'delegate_to') or k == action or k == 'shell':
+            if k in ('action', 'local_action', 'args', 'connection') or k == action or k == 'shell':
                 # we don't want to re-assign these values, which were
                 # determined by the ModuleArgsParser() above
                 continue
             elif k.replace("with_", "") in lookup_loader:
                 self._preprocess_loop(ds, new_ds, k, v)
             else:
-                new_ds[k] = v
+                # pre-2.0 syntax allowed variables for include statements at the
+                # top level of the task, so we move those into the 'vars' dictionary
+                # here, and show a deprecation message as we will remove this at
+                # some point in the future.
+                if action == 'include' and k not in self._get_base_attributes():
+                    self._display.deprecated("Specifying include variables at the top-level of the task is deprecated. Please see:\nhttp://docs.ansible.com/ansible/playbooks_roles.html#task-include-files-and-encouraging-reuse\n\nfor currently supported syntax regarding included files and variables")
+                    new_ds['vars'][k] = v
+                else:
+                    new_ds[k] = v
 
         return super(Task, self).preprocess_data(new_ds)
 
@@ -192,20 +206,38 @@ class Task(Base, Conditional, Taggable, Become):
 
         super(Task, self).post_validate(templar)
 
+    def _post_validate_loop_args(self, attr, value, templar):
+        '''
+        Override post validation for the loop args field, which is templated
+        specially in the TaskExecutor class when evaluating loops.
+        '''
+        return value
+
+    def _post_validate_environment(self, attr, value, templar):
+        '''
+        Override post validation of vars on the play, as we don't want to
+        template these too early.
+        '''
+        for env_item in value:
+            if isinstance(env_item, (string_types, AnsibleUnicode)) and env_item in templar._available_variables.keys():
+                self._display.deprecated("Using bare variables for environment is deprecated. Update your playbooks so that the environment value uses the full variable syntax ('{{foo}}')")
+                break
+        return templar.template(value, convert_bare=True)
+
     def get_vars(self):
-        all_vars = self.vars.copy()
+        all_vars = dict()
         if self._block:
             all_vars.update(self._block.get_vars())
         if self._task_include:
             all_vars.update(self._task_include.get_vars())
 
-        #if isinstance(self.args, dict):
-        #    all_vars.update(self.args)
+        all_vars.update(self.vars)
 
         if 'tags' in all_vars:
             del all_vars['tags']
         if 'when' in all_vars:
             del all_vars['when']
+
         return all_vars
 
     def copy(self, exclude_block=False):
@@ -310,4 +342,16 @@ class Task(Base, Conditional, Taggable, Become):
             else:
                 value = parent_value
         return value
+
+    def _get_attr_environment(self):
+        '''
+        Override for the 'tags' getattr fetcher, used from Base.
+        '''
+        environment = self._attributes['tags']
+        if environment is None:
+            environment = dict()
+
+        environment = self._get_parent_attribute('environment', extend=True)
+
+        return environment
 

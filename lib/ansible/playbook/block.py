@@ -37,12 +37,13 @@ class Block(Base, Become, Conditional, Taggable):
     # similar to the 'else' clause for exceptions
     #_otherwise = FieldAttribute(isa='list')
 
-    def __init__(self, play=None, parent_block=None, role=None, task_include=None, use_handlers=False):
+    def __init__(self, play=None, parent_block=None, role=None, task_include=None, use_handlers=False, implicit=False):
         self._play         = play
         self._role         = role
         self._task_include = task_include
         self._parent_block = parent_block
         self._use_handlers = use_handlers
+        self._implicit     = implicit
         self._dep_chain    = []
 
         super(Block, self).__init__()
@@ -53,22 +54,32 @@ class Block(Base, Become, Conditional, Taggable):
         of a role or task include which does, so return those if present.
         '''
 
-        all_vars = dict()
+        all_vars = self.vars.copy()
 
         if self._role:
-            all_vars.update(self._role.get_vars())
+            all_vars.update(self._role.get_vars(self._dep_chain))
         if self._parent_block:
             all_vars.update(self._parent_block.get_vars())
         if self._task_include:
             all_vars.update(self._task_include.get_vars())
 
-        all_vars.update(self.vars)
         return all_vars
 
     @staticmethod
     def load(data, play=None, parent_block=None, role=None, task_include=None, use_handlers=False, variable_manager=None, loader=None):
-        b = Block(play=play, parent_block=parent_block, role=role, task_include=task_include, use_handlers=use_handlers)
+        implicit = not Block.is_block(data)
+        b = Block(play=play, parent_block=parent_block, role=role, task_include=task_include, use_handlers=use_handlers, implicit=implicit)
         return b.load_data(data, variable_manager=variable_manager, loader=loader)
+
+    @staticmethod
+    def is_block(ds):
+        is_block = False
+        if isinstance(ds, dict):
+            for attr in ('block', 'rescue', 'always'):
+                if attr in ds:
+                    is_block = True
+                    break
+        return is_block
 
     def preprocess_data(self, ds):
         '''
@@ -76,13 +87,7 @@ class Block(Base, Become, Conditional, Taggable):
         is created, which goes in the main portion of the block
         '''
 
-        is_block = False
-        for attr in ('block', 'rescue', 'always'):
-            if attr in ds:
-                is_block = True
-                break
-
-        if not is_block:
+        if not Block.is_block(ds):
             if isinstance(ds, list):
                 return super(Block, self).preprocess_data(dict(block=ds))
             else:
@@ -301,16 +306,28 @@ class Block(Base, Become, Conditional, Taggable):
 
         return value
 
-    def filter_tagged_tasks(self, connection_info, all_vars):
+    def _get_attr_environment(self):
+        '''
+        Override for the 'tags' getattr fetcher, used from Base.
+        '''
+        environment = self._attributes['tags']
+        if environment is None:
+            environment = dict()
+
+        environment = self._get_parent_attribute('environment', extend=True)
+
+        return environment
+
+    def filter_tagged_tasks(self, play_context, all_vars):
         '''
         Creates a new block, with task lists filtered based on the tags contained
-        within the connection_info object.
+        within the play_context object.
         '''
 
         def evaluate_and_append_task(target):
             tmp_list = []
             for task in target:
-                if task.evaluate_tags(connection_info.only_tags, connection_info.skip_tags, all_vars=all_vars):
+                if task.action in ('meta', 'include') or task.evaluate_tags(play_context.only_tags, play_context.skip_tags, all_vars=all_vars):
                     tmp_list.append(task)
             return tmp_list
 
